@@ -102,10 +102,10 @@ void BM_MxMColMajorVectors(benchmark::State &state) {
   auto C = makeInitializedStridedMemRefDescriptor<TypeRES, 1>({1}, zeroInit);
   StringLiteral funcName = "matmult_column_major";
 
-  vector::VectorTransformsOptions vectorTransformsOptions{
-      LowerToLLVMMatrixIntrinsics};
-  CompilationOptions compilationOptions{/*llvmOptLevel=*/3, /*llcOptLevel=*/3,
-                                        vectorTransformsOptions};
+  CompilationOptions compilationOptions{
+      /*llvmOptLevel=*/3, /*llcOptLevel=*/3,
+      vector::VectorTransformsOptions().setVectorTransformsOptions(
+          vector::VectorContractLowering::Matmul)};
   if (MeasureBuild) {
     // If this is a build-time benchmark, build, compile, and execute
     // the function inside the timed loop, building a fresh new function
