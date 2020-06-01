@@ -21,6 +21,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "iree/compiler/Conversion/CodegenUtils/MarkerUtils.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
 #include "iree/compiler/Dialect/IREE/IR/IREEOps.h"
 #include "llvm/ADT/STLExtras.h"
@@ -31,6 +32,7 @@
 #include "mlir/Dialect/SPIRV/SPIRVLowering.h"
 #include "mlir/Dialect/SPIRV/SPIRVOps.h"
 #include "mlir/Dialect/SPIRV/SPIRVTypes.h"
+#include "mlir/Dialect/StandardOps/IR/Ops.h"
 #include "mlir/IR/Function.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
@@ -188,6 +190,89 @@ struct LinalgReshapeConverter final
   }
 };
 
+/// Convert subview to an access chain corresponding to the offset.
+struct SubViewConverter final : public SPIRVOpLowering<SubViewOp> {
+  using SPIRVOpLowering<SubViewOp>::SPIRVOpLowering;
+  LogicalResult matchAndRewrite(
+      SubViewOp subview, ArrayRef<Value> operands,
+      ConversionPatternRewriter &rewriter) const override {
+    auto loc = subview.getLoc();
+    SmallVector<Value, 4> offsets =
+        getOrCreateOffsets(subview, operands, rewriter, loc);
+    Value ptr = spirv::getElementPtr(
+        typeConverter, subview.source().getType().cast<MemRefType>(),
+        operands[0], offsets, loc, rewriter);
+    rewriter.replaceOp(subview, ptr);
+    return success();
+  }
+
+ private:
+  /// Extract offsets from subview op. If the offets are static we need to
+  /// create a ConstantOp.
+  SmallVector<Value, 4> getOrCreateOffsets(SubViewOp subview,
+                                           ArrayRef<Value> operands,
+                                           OpBuilder &b, Location loc) const {
+    unsigned dynamicIdx = 1;
+    return llvm::to_vector<4>(llvm::map_range(
+        subview.static_offsets().cast<ArrayAttr>(), [&](Attribute a) -> Value {
+          int64_t staticOffset = a.cast<IntegerAttr>().getInt();
+          if (ShapedType::isDynamicStrideOrOffset(staticOffset))
+            return operands[dynamicIdx++];
+          else
+            return b.create<spirv::ConstantOp>(
+                loc, b.getI32Type(),
+                IntegerAttr::get(b.getI32Type(), staticOffset));
+        }));
+  }
+};
+
+/// Convert subgroup level matmul to SPIRV cooperative matrix if those are
+/// supported.
+class LinalgMatMulConverter final : public SPIRVOpLowering<linalg::MatmulOp> {
+ public:
+  using SPIRVOpLowering<linalg::MatmulOp>::SPIRVOpLowering;
+
+  LogicalResult matchAndRewrite(
+      linalg::MatmulOp matmulOp, ArrayRef<Value> operands,
+      ConversionPatternRewriter &rewriter) const override {
+    // Check that the matmul can be natively supported in SPIRV.
+    if (!hasSPIRVMarker(matmulOp)) return failure();
+    auto loc = matmulOp.getLoc();
+    auto M = matmulOp.getOperand(0).getType().cast<MemRefType>().getShape()[1];
+    auto K = matmulOp.getOperand(1).getType().cast<MemRefType>().getShape()[0];
+    auto loadA = loadMatrix(0, matmulOp, operands, M, rewriter);
+    auto loadB = loadMatrix(1, matmulOp, operands, K, rewriter);
+    auto loadC = loadMatrix(2, matmulOp, operands, M, rewriter);
+    auto matmul = rewriter.create<spirv::CooperativeMatrixMulAddNVOp>(
+        loc, loadC.getType(), loadA, loadB, loadC);
+    rewriter.create<spirv::CooperativeMatrixStoreNVOp>(
+        loc, loadC.pointer(), matmul, loadC.stride(), loadC.columnmajor(),
+        IntegerAttr());
+    rewriter.eraseOp(matmulOp);
+    return success();
+  }
+
+ private:
+  // Helper to load the cooperative matrix.
+  spirv::CooperativeMatrixLoadNVOp loadMatrix(
+      int32_t index, linalg::MatmulOp matmulOp, ArrayRef<Value> operands,
+      int32_t stride, ConversionPatternRewriter &rewriter) const {
+    auto loc = matmulOp.getLoc();
+    auto subViewPtr = operands[index];
+    auto memref = matmulOp.getOperand(index).getType().cast<MemRefType>();
+    auto int32Type = rewriter.getI32Type();
+    auto strideValue = rewriter.create<spirv::ConstantOp>(
+        loc, rewriter.getI32Type(), IntegerAttr::get(int32Type, stride));
+    auto coloumnMajor = rewriter.create<spirv::ConstantOp>(
+        loc, rewriter.getI1Type(), rewriter.getBoolAttr(false));
+    auto matType = spirv::CooperativeMatrixNVType::get(
+        memref.getElementType(), spirv::Scope::Subgroup, 8, 8);
+    auto load = rewriter.create<spirv::CooperativeMatrixLoadNVOp>(
+        loc, matType, subViewPtr, strideValue, coloumnMajor, IntegerAttr());
+    return load;
+  }
+};
+
 /// A pass to perform the SPIR-V conversion.
 ///
 /// This pass converts remaining interface ops into SPIR-V global variables,
@@ -261,8 +346,10 @@ void ConvertToSPIRVPass::runOnOperation() {
   populateStandardToSPIRVPatterns(context, typeConverter, patterns);
   // Pull in builtin func to spv.func conversion.
   populateBuiltinFuncToSPIRVPatterns(context, typeConverter, patterns);
-  patterns.insert<HALInterfaceLoadConstantConverter, IREEPlaceholderConverter,
-                  LinalgReshapeConverter>(context, typeConverter);
+  patterns
+      .insert<HALInterfaceLoadConstantConverter, IREEPlaceholderConverter,
+              LinalgReshapeConverter, LinalgMatMulConverter, SubViewConverter>(
+          context, typeConverter);
 
   std::unique_ptr<ConversionTarget> target =
       spirv::SPIRVConversionTarget::get(targetAttr);
