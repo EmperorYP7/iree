@@ -132,7 +132,7 @@ check to make sure the loader is at a proper version.
 
 ### Support in Bazel Tests
 
-Bazel tests run in a sandbox, which environment variables may be forwarded to
+Bazel tests run in a sandbox, to which environment variables may be forwarded to
 using the `--test_env` flag. A user.bazelrc file supporting each of the steps
 above looks like this (substitute for the `{}` paths):
 
